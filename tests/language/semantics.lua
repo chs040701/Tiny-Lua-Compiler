@@ -911,6 +911,12 @@ return function(suite)
           ]])
         end, "may skip the exit of an upvalue%-capturing")
       end)
+
+      suite:it("reports the line of a syntax error", function()
+        suite:assertError(function()
+          tlc.compileToProto("local x = 1\nlocal y = 2\nlocal z = = 3\n")
+        end, "^3: Expected at least one expression")
+      end)
     end)
 
     suite:describe("Virtual machine diagnostics", function()
@@ -939,6 +945,44 @@ return function(suite)
             table0:method()
           ]])
         end, "TLC VM SELF on nil value: pc=%d+/%d+ reg=R%d+ key=method")
+      end)
+
+      suite:it("reports the statement line of a VM error", function()
+        suite:assertError(function()
+          tlc.run("local table0 = nil\nreturn table0.key\n")
+        end, "^2: TLC VM GETTABLE on nil value")
+      end)
+
+      suite:it("decorates native errors with the source line and a TLC trace", function()
+        local expected = "^<tlc>:2: attempt to perform arithmetic[^\n]*\n"
+          .. "stack traceback:\n\tline 2: in function$"
+
+        suite:assertError(function()
+          tlc.run([[
+            local function fail()
+              return nil + 1
+            end
+            return fail()
+          ]])
+        end, expected)
+      end)
+
+      suite:it("lists every active TLC frame in the traceback", function()
+        local expected = "stack traceback:\n\tline 2: in function\n"
+          .. "\tline 5: in function$"
+
+        suite:assertError(function()
+          tlc.run([[
+            local function inner()
+              return nil + 1
+            end
+            local function outer()
+              local value = inner()
+              return value
+            end
+            return outer()
+          ]])
+        end, expected)
       end)
 
       suite:it("keeps normal table access working", function()

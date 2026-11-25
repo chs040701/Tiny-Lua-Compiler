@@ -53,6 +53,13 @@
 --------------------------------------------------------------------------------
 -- stylua: ignore start
 
+-- Diagnostics that carry a source location are raised with level 0: the message
+-- already starts with the statement line, so Lua's own chunk position would only
+-- add the line inside tlc.lua, which says nothing about the compiled script.
+local function raiseError(message)
+  error(message, 0)
+end
+
 -- In Lua, iterating over a list to check for existence is slow. By converting
 -- the list `{"a", "b"}` into `{a=true, b=true}`, we leverage Lua's internal
 -- hash map architecture. This makes checking `if keywords[word]` faster than
@@ -205,15 +212,51 @@ function Tokenizer.new(code)
     "Tokenizer.new requires a string as input code. Got: " .. type(code)
   )
 
+  -- Line/column are only needed for error messages and stack traces, so instead
+  -- of tracking them while consuming characters we index where every line
+  -- starts once and convert a character position on demand (see `lineOfPos`).
+  -- `tokenize` walks this index with a moving cursor: O(1) amortized per token.
+  local lineStarts = { 1 }
+  local searchPos  = 0
+  while true do
+    local newlinePos = string.find(code, "\n", searchPos + 1, true)
+    if not newlinePos then break end
+    lineStarts[#lineStarts + 1] = newlinePos + 1
+    searchPos = newlinePos
+  end
+
   -- Create the instance table and set its metatable to `Tokenizer`.
   -- This grants the instance access to all methods defined in the Tokenizer
   -- class (like `consume`, `getNextToken`, `tokenize`, etc.) via prototypal
   -- inheritance, avoiding the need to copy methods for each instance.
   return setmetatable({
-    code       = code,
-    curChar    = code:sub(1, 1),
-    curCharPos = 1
+    code          = code,
+    curChar       = code:sub(1, 1),
+    curCharPos    = 1,
+    tokenStartPos = 1,
+    lineStarts    = lineStarts
   }, Tokenizer)
+end
+
+-- Converts a 1-based character position into a (line, column) pair.
+function Tokenizer:lineOfPos(pos)
+  local lineStarts = self.lineStarts
+  local low, high  = 1, #lineStarts
+  while low < high do
+    local middle = math.floor((low + high + 1) / 2)
+    if lineStarts[middle] <= pos then
+      low = middle
+    else
+      high = middle - 1
+    end
+  end
+  return low, pos - lineStarts[low] + 1
+end
+
+-- Prefix for diagnostics that carry a source location, e.g. `12: `.
+function Tokenizer:locationPrefix(pos)
+  local line = self:lineOfPos(pos or self.curCharPos)
+  return line .. ": "
 end
 
 --// Character Navigation //--
@@ -306,7 +349,7 @@ function Tokenizer:consumeHexadecimalNumber()
   -- At least one hex digit is required after the prefix.
   local _, endPos = string.find(self.code, "^[0-9a-fA-F]+", self.curCharPos + 2)
   if not endPos then
-    error(string.format(
+    raiseError(self:locationPrefix() .. string.format(
       "malformed number near '%s'",
       self.code:sub(startPos, self.curCharPos - 1)
     ))
@@ -318,7 +361,7 @@ function Tokenizer:consumeHexadecimalNumber()
   if nextChar == "p" or nextChar == "P" then
     local _, exponentEndPos = string.find(self.code, "^[0-9]+", endPos + 2)
     if not exponentEndPos then
-      error(string.format(
+      raiseError(self:locationPrefix() .. string.format(
         "malformed number near '%s'",
         self.code:sub(startPos, self.curCharPos - 1)
       ))
@@ -362,7 +405,7 @@ function Tokenizer:consumeNumber()
     _, endPos = string.find(self.code, "^[+-]?[0-9]+", endPos + 2)
 
     if not endPos then
-      error(string.format(
+      raiseError(self:locationPrefix() .. string.format(
         "malformed number near '%s'",
         self.code:sub(startPos, self.curCharPos - 1)
       ))
@@ -378,7 +421,7 @@ function Tokenizer:consumeNumber()
   -- The official Lua lexer treats this as a malformed number, not an
   -- identifier. We replicate this behavior for compatibility.
   if TOKENIZER_CONFIG.IDENTIFIER_START[self.curChar] then
-    error(string.format(
+    raiseError(self:locationPrefix() .. string.format(
       "malformed number near '%s'",
       self.code:sub(startPos, self.curCharPos - 1)
     ))
@@ -407,7 +450,9 @@ function Tokenizer:consumeEscapeSequence()
     local numberString = self.code:sub(startPos, endPos)
     local number = tonumber(numberString)
     if number > 255 then
-      error(string.format("escape sequence too large near '\\%s'", numberString))
+      raiseError(self:locationPrefix() .. string.format(
+        "escape sequence too large near '\\%s'", numberString
+      ))
     end
 
     self:setCurrentPosition(endPos + 1)
@@ -429,9 +474,9 @@ function Tokenizer:consumeSimpleString()
 
   while self.curChar ~= quoteChar do
     if self.curChar == END_OF_FILE then
-      error("Unclosed string")
+      raiseError(self:locationPrefix() .. "Unclosed string")
     elseif self.curChar == "\n" then
-      error("Unclosed string (newline found)")
+      raiseError(self:locationPrefix() .. "Unclosed string (newline found)")
 
     -- Is it an escape sequence?
     elseif self.curChar == "\\" then
@@ -457,7 +502,7 @@ function Tokenizer:consumeLongString()
   self:consume(depth) -- Consume the '=' characters.
 
   if self.curChar ~= "[" then
-    error("Invalid long string delimiter")
+    raiseError(self:locationPrefix() .. "Invalid long string delimiter")
   end
   self:consume(1)
   local firstStringChar = self.curChar
@@ -476,7 +521,7 @@ function Tokenizer:consumeLongString()
   local closingDelimiter = "%]" .. string.rep("=", depth) .. "%]"
   local startPos, endPos = string.find(self.code, closingDelimiter, self.curCharPos)
   if not endPos then
-    error("Unclosed long string")
+    raiseError(self:locationPrefix() .. "Unclosed long string")
   end
 
   self:setCurrentPosition(endPos + 1)
@@ -537,7 +582,7 @@ function Tokenizer:skipLongComment()
   local closingDelimiter = "%]" .. string.rep("=", depth) .. "%]"
   local _, endPos = string.find(self.code, closingDelimiter, self.curCharPos)
   if not endPos then
-    error("Unclosed long comment")
+    raiseError(self:locationPrefix() .. "Unclosed long comment")
   end
 
   self:setCurrentPosition(endPos + 1)
@@ -568,11 +613,13 @@ end
 -- progressively less common. Symbolic operators are matched via the trie.
 -- Unsafe punctuation is handled last as a fallback.
 function Tokenizer:getNextToken()
+  self.tokenStartPos = self.curCharPos
   local curChar = self.curChar
 
   if TOKENIZER_CONFIG.WHITESPACE[curChar] then
     self:skipWhitespace()
     curChar = self.curChar
+    self.tokenStartPos = self.curCharPos
 
     -- If the stream ends with whitespace, check here to avoid returning
     -- a stale token to the caller.
@@ -606,7 +653,7 @@ function Tokenizer:getNextToken()
     local numberString = self:consumeNumber()
     local numberValue = tonumber(numberString)
     if not numberValue then
-      error(string.format(
+      raiseError(self:locationPrefix() .. string.format(
         "malformed number near '%s'",
         numberString
       ))
@@ -628,7 +675,7 @@ function Tokenizer:getNextToken()
       local numberString = self:consumeNumber()
       local numberValue = tonumber(numberString)
       if not numberValue then
-        error(string.format(
+        raiseError(self:locationPrefix() .. string.format(
           "malformed number near '%s'",
           numberString
         ))
@@ -666,7 +713,7 @@ function Tokenizer:getNextToken()
   -- If we reach this point, it means the current character doesn't match
   -- any known token kind. This is an error condition, as the character
   -- is not valid in the Lua language syntax.
-  error(string.format(
+  raiseError(self:locationPrefix() .. string.format(
     "Unexpected character '%s' at position %d",
     tostring(curChar),
     self.curCharPos
@@ -677,15 +724,27 @@ end
 function Tokenizer:tokenize()
   local tokens, tokenIndex = {}, 0
 
+  -- The tokenizer only moves forward, so the line cursor never has to rewind.
+  local lineStarts = self.lineStarts
+  local lineCount  = #lineStarts
+  local lineIndex  = 1
+
   while self.curChar ~= END_OF_FILE do
     local tokenKind, tokenValue, tokenRaw = self:getNextToken()
 
     if tokenKind then
+      local tokenPos = self.tokenStartPos
+      while lineIndex < lineCount and lineStarts[lineIndex + 1] <= tokenPos do
+        lineIndex = lineIndex + 1
+      end
+
       tokenIndex = tokenIndex + 1
       tokens[tokenIndex] = {
         kind  = tokenKind,
         value = tokenValue,
-        raw   = tokenRaw
+        raw   = tokenRaw,
+        line  = lineIndex,
+        col   = tokenPos - lineStarts[lineIndex] + 1
       }
     end
   end
@@ -696,7 +755,9 @@ function Tokenizer:tokenize()
   table.insert(tokens, {
     kind  = "EOF",
     value = nil,
-    raw   = nil
+    raw   = nil,
+    line  = lineIndex,
+    col   = 1
   })
 
   return tokens
@@ -859,6 +920,14 @@ function Parser:getTokenDescription(token)
   return string.format("%s [%s]", tostring(token.kind), tostring(token.value))
 end
 
+-- Prefix for syntax errors, e.g. `12: `. Falls back to no prefix when the
+-- token carries no position (hand-built token lists in tests).
+function Parser:locationPrefix(token)
+  local line = (token or self.currentToken).line
+  if not line then return "" end
+  return line .. ": "
+end
+
 function Parser:expect(tokenKind, tokenValue)
   local token = self.currentToken
   if token.kind == tokenKind and token.value == tokenValue then
@@ -866,7 +935,7 @@ function Parser:expect(tokenKind, tokenValue)
     return
   end
 
-  error(string.format(
+  raiseError(self:locationPrefix(token) .. string.format(
     "Expected %s [%s] token, got: %s",
     tostring(tokenKind),
     tostring(tokenValue),
@@ -918,7 +987,7 @@ end
 
 function Parser:expectKind(expectedKind)
   if not self:isTokenKind(expectedKind) then
-    error(string.format(
+    raiseError(self:locationPrefix() .. string.format(
       "Expected a %s, but found %s",
       tostring(expectedKind),
       tostring(self.currentToken.kind)
@@ -930,7 +999,7 @@ end
 
 function Parser:expectKeyword(keyword)
   if not self:isKeyword(keyword) then
-    error(string.format(
+    raiseError(self:locationPrefix() .. string.format(
       "Expected keyword '%s', but found %s",
       keyword,
       self:getTokenDescription(self.currentToken)
@@ -1029,7 +1098,7 @@ function Parser:parseParameterList()
       break
 
     else
-      error(string.format(
+      raiseError(self:locationPrefix() .. string.format(
         "Expected parameter name or '...', but got: %s",
         self:getTokenDescription(self.currentToken)
       ))
@@ -1038,7 +1107,7 @@ function Parser:parseParameterList()
     if self.currentToken.kind == "RightParen" then
       break
     elseif not self:advanceIfMatch("Comma") then
-      error(string.format(
+      raiseError(self:locationPrefix() .. string.format(
         "Expected ',' or ')' after parameter, but got: %s",
         self:getTokenDescription(self.currentToken)
       ))
@@ -1074,7 +1143,7 @@ function Parser:parseIndexSuffix(tableExpression)
     self:expectKind("RightBracket")
 
   else
-    error(string.format(
+    raiseError(self:locationPrefix() .. string.format(
       "Expected '.' or '[' for index expression, but got: %s",
       self:getTokenDescription(self.currentToken)
     ))
@@ -1154,7 +1223,7 @@ function Parser:parseTableConstructor()
       -- Or is the next token the end of the table?
       and not self:isTokenKind("RightBrace")
     then
-      error(string.format(
+      raiseError(self:locationPrefix() .. string.format(
         "Expected ',' or ';' after table element, but got: %s",
         self:getTokenDescription(self.currentToken)
       ))
@@ -1199,7 +1268,7 @@ function Parser:parseCallSuffix(calleeExpression, isMethodCall)
     arguments = { self:parseTableConstructor() }
 
   else
-    error(string.format(
+    raiseError(self:locationPrefix() .. string.format(
       "Expected function call arguments (parentheses, string, or table), but got: %s",
       self:getTokenDescription(curToken)
     ))
@@ -1405,7 +1474,7 @@ function Parser:parseUnaryOperator()
   local operator = self.currentToken.value
   self:advance(1)
   local operand = self:parseBinaryExpression(PARSER_CONFIG.UNARY_PRECEDENCE)
-  if not operand then error("Unexpected end") end
+  if not operand then raiseError(self:locationPrefix() .. "Unexpected end") end
 
   return { kind = "UnaryOperator",
     operator = operator,
@@ -1434,7 +1503,7 @@ function Parser:parseBinaryExpression(previousPrecedence)
     self:advance(1)
 
     local right = self:parseBinaryExpression(precedence[2])
-    if not right then error("Unexpected end") end
+    if not right then raiseError(self:locationPrefix() .. "Unexpected end") end
 
     expression = { kind = "BinaryOperator",
       operator = operator,
@@ -1457,7 +1526,7 @@ end
 function Parser:expectExpression()
   local expression = self:parseExpression()
   if not expression then
-    error(
+    raiseError(self:locationPrefix() ..
       "Expected an expression, but found: "
       .. self:getTokenDescription(self.currentToken)
     )
@@ -1485,7 +1554,7 @@ end
 function Parser:expectOneOrMoreExpressions()
   local expressions = self:parseExpressionList()
   if #expressions == 0 then
-    error(
+    raiseError(self:locationPrefix() ..
       "Expected at least one expression, but found: "
       .. self:getTokenDescription(self.currentToken)
     )
@@ -1638,12 +1707,12 @@ function Parser:parseForStatement()
     self:expect("Equals")
     local expressions = self:expectOneOrMoreExpressions()
     if #expressions > 3 then
-      error(
+      raiseError(self:locationPrefix() ..
         "Numeric 'for' loop allows at most a start, limit, "
         .. "and optional step expression."
       )
     elseif #expressions < 2 then
-      error(
+      raiseError(self:locationPrefix() ..
         "Numeric 'for' loop requires at least a start and limit expression."
       )
     end
@@ -1718,7 +1787,7 @@ function Parser:parseAssignment(firstLvalue)
   while self:advanceIfMatch("Comma") do
     local nextLValue = self:parsePrefixExpression()
     if not self:isValidAssignmentLvalue(nextLValue) then
-      error(
+      raiseError(self:locationPrefix() ..
         "Invalid assignment target: expected identifier or table index, got "
         .. tostring(nextLValue and nextLValue.kind or "nil")
       )
@@ -1761,7 +1830,7 @@ function Parser:parseCallOrAssignment()
     return self:parseAssignment(expression)
   end
 
-  error(string.format(
+  raiseError(self:locationPrefix() .. string.format(
     "Invalid statement: expected an identifier or function call, but got '%s'",
     tostring(expression and expression.kind)
   ))
@@ -1776,6 +1845,9 @@ function Parser:parseNextStatement()
 
   local currentToken = self.currentToken
   local tokenKind    = currentToken.kind
+  -- Every statement remembers where it starts. The code generator turns this
+  -- into the pc -> line marks the VM uses for stack traces.
+  local startLine    = currentToken.line
   if tokenKind == "Colon" then
     node = self:parseLabelStatement()
 
@@ -1790,7 +1862,7 @@ function Parser:parseNextStatement()
 
     local handler = self.statementHandlers[keyword]
     if not handler then
-      error("Unsupported keyword used as a statement starter: " .. keyword)
+      raiseError(self:locationPrefix() .. "Unsupported keyword used as a statement starter: " .. keyword)
     end
     node = handler(self) -- e.g., self:parseWhileStatement().
 
@@ -1803,6 +1875,8 @@ function Parser:parseNextStatement()
   -- Statements can optionally be separated by a semicolon.
   -- In Lua 5.1, a semicolon can't appear after another semicolon.
   self:advanceIfMatch("Semicolon")
+
+  node.line = startLine
 
   return node
 end
@@ -2014,11 +2088,22 @@ function CodeGenerator.new(ast)
     labelLoopDepth    = nil,
     labelDepths       = nil,
     pendingGotoJumps  = nil,
-    loopDepth         = 0
+    loopDepth         = 0,
+
+    -- Line of the statement currently being compiled, used to tag code
+    -- generator diagnostics with a source location.
+    currentLine       = nil
   }, CodeGenerator)
 end
 
 --// Scope Management //--
+
+-- Prefix for code generator diagnostics, e.g. `12: `. Refers to the statement
+-- being compiled, which is the closest thing to a location available here.
+function CodeGenerator:locationPrefix()
+  if not self.currentLine then return "" end
+  return self.currentLine .. ": "
+end
 
 -- By the time we leave a function scope, every temporary register should have
 -- been freed. That means the only live registers left should be the ones owned
@@ -2034,7 +2119,7 @@ function CodeGenerator:validateRegisterUsage()
   local variableCount = currentScope.localCount
 
   if currentRegisters ~= variableCount then
-    error(string.format(
+    raiseError(self:locationPrefix() .. string.format(
       "Register allocation mismatch: allocated %d registers but have %d "
       .. "variables in scope. This is a compiler bug.",
       currentRegisters,
@@ -2171,11 +2256,14 @@ end
 --   - constants: Pool of literal values (numbers, strings)
 --   - upvalues:  Names of captured variables from enclosing scopes
 --   - protos:    Nested function prototypes (children)
+--   - lineMarks: pc -> source line of the statement that starts there, used to
+--                turn a program counter back into a line number for traces
 function CodeGenerator:createPrototype(properties)
   return {
     code      = {},
     constants = {},
     protos    = {},
+    lineMarks = {},
 
     -- Tracks the maximum register index used by this function, which is used
     -- in the Lua VM to preallocate the most optimal amount of registers for
@@ -2789,7 +2877,7 @@ function CodeGenerator:TableConstructor(node, register)
   -- encoding the page count in the next pseudo-instruction. TLC errors out
   -- instead for simplicity.
   if totalPages >= 512 then
-    error("CodeGenerator: Table page overflow! Maximum of 511 pages allowed.")
+    raiseError(self:locationPrefix() .. "CodeGenerator: Table page overflow! Maximum of 511 pages allowed.")
   end
 
   for page = 1, totalPages do
@@ -3003,11 +3091,11 @@ function CodeGenerator:GotoStatement(node)
   local targetPC = self.labelPositions[node.label]
   if targetPC then
     if self.labelLoopDepth[node.label] > self.loopDepth then
-      error("goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
+      raiseError(self:locationPrefix() .. "goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
     end
     local crosses = crossesCloseScope(closes, gotoDepth, self.labelDepths[node.label])
     if crosses then
-      error("goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
+      raiseError(self:locationPrefix() .. "goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
         .. "scope, which is not supported")
     end
     local jumpPC = self:emitJump()
@@ -3039,11 +3127,11 @@ function CodeGenerator:LabelStatement(node)
   if pending then
     for _, entry in ipairs(pending) do
       if self.loopDepth > entry.loopDepth then
-        error("goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
+        raiseError(self:locationPrefix() .. "goto '" .. node.label .. "' jumps into a deeper loop, which is not supported")
       end
       local crosses = crossesCloseScope(entry.closes, entry.gotoDepth, labelDepth)
       if crosses then
-        error("goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
+        raiseError(self:locationPrefix() .. "goto '" .. node.label .. "' may skip the exit of an upvalue-capturing "
           .. "scope, which is not supported")
       end
       self:patchJump(entry.pc, #self.proto.code + 1)
@@ -3414,7 +3502,7 @@ function CodeGenerator:compileExpressionNode(node, register, resultRegisters)
 
   local func = self[node.kind]
   if not func then
-    error("CodeGenerator: Expression node kind not supported: " .. node.kind)
+    raiseError(self:locationPrefix() .. "CodeGenerator: Expression node kind not supported: " .. node.kind)
   end
 
   return register, func(self, node, register, resultRegisters or 1)
@@ -3480,7 +3568,16 @@ function CodeGenerator:compileStatementList(statementList)
   for _, node in ipairs(statementList) do
     local nodeHandler = self[node.kind]
     if not nodeHandler then
-      error("CodeGenerator: Statement node kind not supported: " .. node.kind)
+      raiseError(self:locationPrefix() .. "CodeGenerator: Statement node kind not supported: " .. node.kind)
+    end
+
+    -- Mark where this statement's code starts so the VM can map any program
+    -- counter inside it back to a source line (one hash slot per statement,
+    -- nothing per instruction).
+    local line = node.line
+    if line then
+      self.currentLine = line
+      self.proto.lineMarks[#self.proto.code + 1] = line
     end
 
     nodeHandler(self, node)
@@ -3529,7 +3626,7 @@ function CodeGenerator:compileFunctionBody(node)
   -- Anything still pending here targets a label that does not exist in this
   -- function, which is a compile error.
   for label in pairs(self.pendingGotoJumps) do
-    error("goto '" .. label .. "' has no matching '::" .. label .. "::' label in its function")
+    raiseError(self:locationPrefix() .. "goto '" .. label .. "' has no matching '::" .. label .. "::' label in its function")
   end
 
   -- Generate default return statement.
@@ -4309,6 +4406,142 @@ local VirtualMachine = {}
 local CLOSURE_ENV_SENTINEL = {}
 local getfenv = getfenv
 local setfenv = setfenv
+local xpcall = xpcall
+local select = select
+local error = error
+local tostring = tostring
+local type = type
+
+--// Trace State //--
+--
+-- TLC frames carry no debug info, so a native Lua stack trace collapses into a
+-- single `executeClosure` entry. We keep our own call stack instead: one slot
+-- per active TLC function holding its prototype and the source line of the
+-- statement it is currently executing. The line slot is refreshed on every
+-- statement boundary by the interpreter loop (one table lookup per instruction,
+-- no per-instruction writes), so an error raised anywhere - including from
+-- native operations like arithmetic on nil - can be attributed to a line.
+--
+-- Tail calls replace the frame, matching Lua's own behaviour: once the call
+-- starts, the tail-calling frame is gone.
+local vmProtoStack, vmLineStack, vmDepth = {}, {}, 0
+local TRACE_MAX_FRAMES = 20
+
+-- Stand-in for prototypes without line marks, so the interpreter loop never has
+-- to nil-check the table it looks lines up in.
+local EMPTY_LINE_MARKS = {}
+
+-- Registry of the closures this VM created (weak keys, so it never keeps a
+-- closure alive). OP_TAILCALL consults it to tell a TLC callee - which takes
+-- over the current frame - from a native one, which does not.
+local tlcClosures = setmetatable({}, { __mode = "k" })
+
+function VirtualMachine.resetTrace()
+  for depth = 1, vmDepth do
+    vmProtoStack[depth] = nil
+    vmLineStack[depth] = nil
+  end
+  vmDepth = 0
+end
+
+-- Formats the active TLC call stack, innermost frame first. Returns nil when
+-- no TLC code is running.
+function VirtualMachine.formatTrace(maxFrames)
+  if vmDepth == 0 then return nil end
+
+  maxFrames = maxFrames or TRACE_MAX_FRAMES
+  local frames = { "stack traceback:" }
+  local shown  = 0
+  for depth = vmDepth, 1, -1 do
+    shown = shown + 1
+    if shown > maxFrames then
+      frames[#frames + 1] = string.format("\t... (%d more frames)", vmDepth - maxFrames)
+      break
+    end
+
+    local proto = vmProtoStack[depth]
+    -- Frames without a prototype are only reachable if a handler cleared the
+    -- trace mid-flight; skip them rather than printing "<unknown>".
+    if proto then
+      local name = proto.name
+      local line = vmLineStack[depth]
+      if name and line then
+        frames[#frames + 1] = string.format("\t%s:%d: in function", name, line)
+      elseif name then
+        frames[#frames + 1] = string.format("\t%s: in function", name)
+      elseif line then
+        frames[#frames + 1] = string.format("\tline %d: in function", line)
+      else
+        frames[#frames + 1] = "\tin function"
+      end
+    end
+  end
+
+  if #frames == 1 then return nil end
+  return table.concat(frames, "\n")
+end
+
+-- Returns the source line of the innermost running TLC frame: the statement that
+-- was executing when an error escaped, plus its prototype name when one is set.
+-- Used to attribute errors raised by native Lua operations (arithmetic on nil,
+-- ...), which carry no TLC location of their own.
+function VirtualMachine.currentSite()
+  if vmDepth == 0 then return nil end
+  local proto = vmProtoStack[vmDepth]
+  return (proto and proto.name) or nil, vmLineStack[vmDepth]
+end
+
+-- Decorate an error that escaped from TLC code with the module, statement line
+-- and TLC call stack. Errors that we raised ourselves are already qualified
+-- (and already reset the trace), so they pass through untouched.
+local function decorateEscapedError(e)
+  -- Non-string error objects stay untouched: decorating would change what the
+  -- catcher receives (business code may error({...}) on purpose).
+  if vmDepth == 0 or type(e) ~= "string" then
+    return e
+  end
+
+  local trace = VirtualMachine.formatTrace()
+  local site, line = VirtualMachine.currentSite()
+  VirtualMachine.resetTrace()
+
+  local message = tostring(e)
+  if line and not message:find("^%d+:") then
+    -- Native Lua errors are prefixed with the position of the raising chunk
+    -- (tlc itself, which is meaningless here); drop it and use ours instead.
+    message = message:gsub("^[^\n]-:%d+:%s*", "")
+    message = string.format("%s:%d: %s", site or "<tlc>", line, message)
+  end
+  if trace then
+    message = message .. "\n" .. trace
+  end
+  return message
+end
+
+-- Raises a VM diagnostic. The message is fully qualified here - source line and
+-- the TLC call stack - because runtime errors surface at arbitrary call sites
+-- (any host code may call a TLC closure directly), not only inside tlc.run, so
+-- no caller can be relied on to decorate them. Formatting happens on the error
+-- path only; the interpreter loop pays a single table lookup per instruction to
+-- keep the line current.
+local function raiseVmError(message)
+  local proto = vmProtoStack[vmDepth]
+  local line  = vmLineStack[vmDepth]
+  local trace = VirtualMachine.formatTrace()
+  VirtualMachine.resetTrace()
+
+  local name = proto and proto.name
+  if name and line then
+    message = string.format("%s:%d: %s", name, line, message)
+  elseif line then
+    message = string.format("%d: %s", line, message)
+  end
+  if trace then
+    message = message .. "\n" .. trace
+  end
+
+  error(message, 0)
+end
 
 --// Execution //--
 
@@ -4412,7 +4645,25 @@ function VirtualMachine.executeClosure(closure, ...)
   -- The current instruction index (also referred to as PC).
   local programCounter = 1
   local codeLength     = #protoCode
+
+  -- Push this frame so diagnostics can report the module and line of the
+  -- statement being executed.
+  local frameDepth = vmDepth + 1
+  vmDepth = frameDepth
+  vmProtoStack[frameDepth] = closureProto
+  vmLineStack[frameDepth]  = 0
+
+  local lineMarks = closureProto.lineMarks or EMPTY_LINE_MARKS
+  local lineStack = vmLineStack
+
   while programCounter <= codeLength do
+    -- Statement boundaries carry a line mark; refresh the frame's line there so
+    -- errors raised by any instruction of the statement point at the right line.
+    local markedLine = lineMarks[programCounter]
+    if markedLine then
+      lineStack[frameDepth] = markedLine
+    end
+
     local instruction = protoCode[programCounter]
     local opname  = instruction.opname
     local a, b, c = instruction.a, instruction.b, instruction.c
@@ -4463,7 +4714,7 @@ function VirtualMachine.executeClosure(closure, ...)
     elseif opname == "GETTABLE" then
       local base = stack[b]
       if base == nil then
-        error(fmtVmIndexError("GETTABLE", programCounter, codeLength, b, rk(c), stack), 0)
+        raiseVmError(fmtVmIndexError("GETTABLE", programCounter, codeLength, b, rk(c), stack))
       end
       stack[a] = base[rk(c)]
 
@@ -4483,7 +4734,7 @@ function VirtualMachine.executeClosure(closure, ...)
     elseif opname == "SETTABLE" then
       local base = stack[a]
       if base == nil then
-        error(fmtVmIndexError("SETTABLE", programCounter, codeLength, a, rk(b), stack), 0)
+        raiseVmError(fmtVmIndexError("SETTABLE", programCounter, codeLength, a, rk(b), stack))
       end
       base[rk(b)] = rk(c)
 
@@ -4498,7 +4749,7 @@ function VirtualMachine.executeClosure(closure, ...)
     elseif opname == "SELF" then
       local rb = stack[b]
       if rb == nil then
-        error(fmtVmIndexError("SELF", programCounter, codeLength, b, rk(c), stack), 0)
+        raiseVmError(fmtVmIndexError("SELF", programCounter, codeLength, b, rk(c), stack))
       end
       stack[a + 1] = rb
       stack[a] = rb[rk(c)]
@@ -4627,6 +4878,9 @@ function VirtualMachine.executeClosure(closure, ...)
     --   stack[A] ... stack[A + C - 2] = return values
     elseif opname == "CALL" then
       local func = stack[a]
+      if func == nil then
+        raiseVmError("attempt to call a nil value")
+      end
       if b ~= USE_CURRENT_TOP then
         stackTop = a + b
       end
@@ -4647,14 +4901,29 @@ function VirtualMachine.executeClosure(closure, ...)
     -- Perform a tail call to a closure (function).
     elseif opname == "TAILCALL" then
       local func = stack[a]
+      if func == nil then
+        raiseVmError("attempt to call a nil value")
+      end
       if b ~= USE_CURRENT_TOP then
         stackTop = a + b
       end
 
-      -- Optimization:
-      --   Since TAILCALL always comes before RETURN,
-      --   we can just return the function call results directly.
-      return func(unpack(stack, a + 1, stackTop - 1))
+      -- A TLC callee takes over this frame (a real tail call, the TLC stack does
+      -- not grow). A native callee pushes nothing, so keep this frame until it
+      -- returns - otherwise an error raised inside it would escape with no
+      -- module/line at all.
+      if tlcClosures[func] then
+        vmDepth = frameDepth - 1
+
+        -- Optimization:
+        --   Since TAILCALL always comes before RETURN,
+        --   we can just return the function call results directly.
+        return func(unpack(stack, a + 1, stackTop - 1))
+      end
+
+      local nResults, results = pack(func(unpack(stack, a + 1, stackTop - 1)))
+      vmDepth = frameDepth - 1
+      return unpack(results, 1, nResults)
 
     -- OP_RETURN [A, B]    return R(A), ... ,R(A+B-2)
     -- Return values from function call.
@@ -4662,6 +4931,8 @@ function VirtualMachine.executeClosure(closure, ...)
       if b ~= USE_CURRENT_TOP then
         stackTop = a + b - 1
       end
+
+      vmDepth = frameDepth - 1
 
       return unpack(stack, a, stackTop - 1)
 
@@ -4694,11 +4965,11 @@ function VirtualMachine.executeClosure(closure, ...)
       local step  = stack[a + 2]
 
       if type(init) ~= "number" then
-        error("'for' initial value must be a number")
+        raiseVmError("'for' initial value must be a number")
       elseif type(limit) ~= "number" then
-        error("'for' limit must be a number")
+        raiseVmError("'for' limit must be a number")
       elseif type(step) ~= "number" then
-        error("'for' step must be a number")
+        raiseVmError("'for' step must be a number")
       end
 
       stack[a] = init - step
@@ -4752,7 +5023,7 @@ function VirtualMachine.executeClosure(closure, ...)
     elseif opname == "SETLIST" then
       local targetTable = stack[a]
       if type(targetTable) ~= "table" then
-        error("SETLIST target is not a table")
+        raiseVmError("SETLIST target is not a table")
       end
 
       local len = b
@@ -4764,7 +5035,7 @@ function VirtualMachine.executeClosure(closure, ...)
       -- We can't implement it here without making the VM execute actual bytecode,
       -- so we will just throw an error if we encounter this case.
       if c == 0 then
-        error("SETLIST with C=0 is not supported in this VM implementation")
+        raiseVmError("SETLIST with C=0 is not supported in this VM implementation")
       end
 
       local offset = (c - 1) * FIELDS_PER_FLUSH
@@ -4815,7 +5086,7 @@ function VirtualMachine.executeClosure(closure, ...)
           local upvalue = closureUpvals[source + 1]
           tProtoUpvalues[upvalueIndex] = upvalue
         else
-          error(
+          raiseVmError(
             "Unexpected instruction while capturing upvalues: "
             .. tostring(nextOpname)
           )
@@ -4835,9 +5106,28 @@ function VirtualMachine.executeClosure(closure, ...)
         if currentEnv ~= CLOSURE_ENV_SENTINEL then
           newClosure.env = currentEnv
         end
+
+        -- Called from native code (not from inside the VM): this is the
+        -- outermost TLC entry, so guard it and decorate whatever error escapes
+        -- with the module, line and TLC trace. Internal TLC-to-TLC calls take
+        -- the plain path below and pay nothing for it.
+        if vmDepth == 0 then
+          local count = select("#", ...)
+          local args  = { ... }
+          local resultCount, results
+          local ok, err = xpcall(function()
+            resultCount, results = pack(VirtualMachine.executeClosure(newClosure, unpack(args, 1, count)))
+          end, decorateEscapedError)
+          if not ok then
+            raiseError(err)
+          end
+          return unpack(results, 1, resultCount)
+        end
+
         return VirtualMachine.executeClosure(newClosure, ...)
       end
       setfenv(closureFn, CLOSURE_ENV_SENTINEL)
+      tlcClosures[closureFn] = true
       stack[a] = closureFn
 
     -- OP_VARARG [A, B]    R(A), R(A+1), ..., R(A+B-1) = vararg
@@ -4853,7 +5143,7 @@ function VirtualMachine.executeClosure(closure, ...)
         stack[a + i - 1] = vararg[i]
       end
     else
-      error("Unimplemented instruction: " .. tostring(opname))
+      raiseVmError("Unimplemented instruction: " .. tostring(opname))
     end
 
     -- Advance to the next instruction.
@@ -4862,6 +5152,7 @@ function VirtualMachine.executeClosure(closure, ...)
 
   -- Should never be reached, as every valid Lua function prototype should
   -- always end with a RETURN instruction that exits the function.
+  vmDepth = frameDepth - 1
   return
 end
 

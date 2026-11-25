@@ -1,8 +1,18 @@
 local tlc = require("tlc")
 
 return function(suite)
+  -- Tokens also carry their source position (`line`/`col`). The shape tests
+  -- only care about kind/value/raw; positions get their own test below.
+  local function tokenShapes(tokens)
+    local shapes = {}
+    for index, token in ipairs(tokens) do
+      shapes[index] = { kind = token.kind, value = token.value, raw = token.raw }
+    end
+    return shapes
+  end
+
   local function assertTokens(source, expected)
-    suite:assertDeepEqual(expected, tlc.tokenize(source))
+    suite:assertDeepEqual(expected, tokenShapes(tlc.tokenize(source)))
   end
 
   suite:describe("Tokenizer", function()
@@ -152,6 +162,24 @@ return function(suite)
           { kind = "Number", value = 1, raw = "1" },
           { kind = "EOF" },
         })
+      end)
+
+      suite:it("records the line and column of every token", function()
+        local tokens = tlc.tokenize("local x = 1\n\n  return x\n")
+
+        local expected = {
+          { line = 1, col = 1 },
+          { line = 1, col = 7 },
+          { line = 1, col = 9 },
+          { line = 1, col = 11 },
+          { line = 3, col = 3 },
+          { line = 3, col = 10 },
+        }
+        for index, position in ipairs(expected) do
+          local token = tokens[index]
+          suite:assertEqual(position.line, token.line, "line at " .. index)
+          suite:assertEqual(position.col, token.col, "column at " .. index)
+        end
       end)
     end)
 
